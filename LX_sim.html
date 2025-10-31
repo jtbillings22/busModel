@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bus Simulation – Fast Mode + Continuous Chart</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #map { height: 100vh; width: 100%; }
+    .hud {
+      position: absolute;
+      top: 12px; right: 12px;
+      background: rgba(255,255,255,0.95);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      z-index: 1002;
+      line-height: 1.4;
+      width: 260px;
+    }
+    #bunchChart {
+  width: 100% !important;
+  height: 100% !important;   /* ⬆️ force canvas to fill the container */
+}
+
+    #chart-container {
+      position: absolute;
+      bottom: 10px; left: 10px;
+      width: 420px; height: 500px;
+      background: rgba(255,255,255,0.95);
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      padding: 10px;
+      z-index: 1001; /* keep above map */
+    }
+    .slider-container { margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="hud">
+    <b>Bunching Monitor</b><br>
+    Current bunch score: <span id="bscore">0.00</span><br>
+    Headway score: <span id="hscore">0.00</span><br>
+    Campus score: <span id="cscore">0.00</span><br>
+    Bunch ratio (avg): <span id="bratio">0.00</span><br>
+    Now bunched: <span id="bnow">0</span><br>
+    Campus cluster: <span id="campus">None</span><br>
+    Avg cluster time: <span id="clusterTime">0.0s</span>
+    <div class="slider-container">
+      Sim Speed: <input type="range" id="speedSlider" min="0.5" max="50" value="1" step="0.5">
+      <span id="speedVal">1×</span>
+    </div>
+  </div>
+
+  <div id="chart-container">
+    <canvas id="bunchChart"></canvas>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // --- Map ---
+    const map = L.map('map').setView([40.505, -74.445], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+    // --- Route (your Rutgers loop) ---
+    const route = [
+      [40.503363, -74.452133], [40.499489, -74.448194],
+      [40.499029, -74.447710], [40.499788, -74.445206],
+      [40.502674, -74.446683], [40.503922, -74.448940],
+      [40.505642, -74.451873], [40.506522, -74.452113],
+      [40.507348, -74.457383], [40.514056, -74.458417],
+      [40.524959, -74.448367], [40.522846, -74.440951],
+      [40.525078, -74.438596], [40.524419, -74.436297],
+      [40.523819, -74.436500], [40.523905, -74.435512],
+      [40.522787, -74.432817], [40.519926, -74.433532],
+      [40.518984, -74.434268], [40.525737, -74.450831],
+      [40.525323, -74.454084], [40.522182, -74.450528],
+      [40.514700, -74.457792], [40.507180, -74.457088],
+      [40.505893, -74.452559], [40.505140, -74.453856],
+      [40.503363, -74.452133]
+    ];
+
+    // Stops: CASC, Yard, SAC, Plaza, LSC, Quads
+    const stopIndices = [0, 1, 5, 12, 14, 17];
+    const stopNames   = ["CASC", "Yard", "SAC", "Plaza", "LSC", "Quads"];
+
+    // Draw route + stops (markers only; no campus shading)
+    const line = L.polyline(route, { color: 'blue', weight: 4 }).addTo(map);
+    map.fitBounds(line.getBounds());
+    stopIndices.forEach((idx, i) =>
+      L.circleMarker(route[idx], { radius: 5, color: 'red', fillColor: 'red', fillOpacity: 0.85 })
+        .bindPopup(stopNames[i]).addTo(map)
+    );
+
+    // --- Distance helpers ---
+    function distance(a, b) {
+      const R = 6371000;
+      const dLat = (b[0] - a[0]) * Math.PI / 180;
+      const dLon = (b[1] - a[1]) * Math.PI / 180;
+      const lat1 = a[0] * Math.PI / 180, lat2 = b[0] * Math.PI / 180;
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+    }
+    const segments = [];
+    let totalDist = 0;
+    const cumulative = [0];
+    for (let i = 0; i < route.length - 1; i++) {
+      const d = distance(route[i], route[i + 1]);
+      segments.push({ start: route[i], end: route[i + 1], dist: d, idx: i });
+      totalDist += d;
+      cumulative.push(totalDist);
+    }
+
+    // --- Campus arc ranges (in arc-length along loop) ---
+    // College Ave campus: between CASC (0) and SAC (5)
+    const CAC_start = cumulative[0],  CAC_end = cumulative[5];
+    // Livingston campus: between Plaza (12) and Quads (17)
+    const LIV_start = cumulative[12], LIV_end = cumulative[17];
+
+    // --- Settings ---
+    const numBuses = 6;
+    const baseSpeed = 200;                 // m/s along arc
+    const stopTime = 200;                  // ms (short dwell)
+    const longStopTime = 3000;             // ms (long dwell)
+    const longStopProb = 0.2;
+    const tau = 0.3;                       // headway threshold fraction
+    const thresholdRatio = 2 / 3;          // campus cluster rule (>= 4 of 6)
+    let simSpeed = 1.0;
+
+    // --- DOM refs ---
+    const els = {
+      bscore: () => document.getElementById('bscore'),
+      hscore: () => document.getElementById('hscore'),
+      cscore: () => document.getElementById('cscore'),
+      bratio: () => document.getElementById('bratio'),
+      bnow: () => document.getElementById('bnow'),
+      campus: () => document.getElementById('campus'),
+      clusterTime: () => document.getElementById('clusterTime')
+    };
+
+    // --- Buses ---
+    const colors = ['red', 'blue', 'green', 'orange', 'purple', 'yellow'];
+    const buses = [];
+    for (let i = 0; i < numBuses; i++) {
+      const offset = (totalDist / numBuses) * i;
+      const svg = encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='28' height='28'>
+        <circle cx='14' cy='14' r='10' fill='${colors[i]}' stroke='black' stroke-width='2'/></svg>`);
+      const icon = L.icon({ iconUrl: "data:image/svg+xml," + svg, iconSize: [28, 28], iconAnchor: [14, 14] });
+      const marker = L.marker(route[0], { icon }).addTo(map);
+      buses.push({
+        marker,
+        traveled: offset,         // arc-length along loop
+        paused: false,
+        lastTime: performance.now(),
+        prevPos: route[0],
+        lastStop: -1
+      });
+    }
+
+    // --- Stop detection ---
+    function passedStop(prev, curr) {
+      for (const idx of stopIndices) {
+        const s = route[idx];
+        if (distance(prev, s) > 15 && distance(curr, s) < 15) return idx;
+      }
+      return -1;
+    }
+
+    // --- Metrics state (simulation-time based) ---
+    let elapsedSim = 0;            // seconds of simulation time
+    let totalSimTime = 0;          // integral: bus-seconds
+    let bunchedSimTime = 0;        // integral: (bunchScore * bus-seconds)
+
+    // For average cluster event duration (in sim seconds)
+    let clusterActive = false;
+    let currentClusterDurSim = 0;
+    let totalClusterDurSim = 0;
+    let clusterEvents = 0;
+
+    // --- Chart ---
+    const ctx = document.getElementById('bunchChart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: { labels: [], datasets: [
+        { label: 'Bunch Score', borderColor: 'red',  data: [], fill: false },
+        { label: 'Bunch Ratio', borderColor: 'blue', data: [], fill: false }
+      ]},
+      options: {
+        responsive: true, animation: false,
+        maintainAspectRatio: false,   // 👈 allow vertical stretching
+
+        scales: {
+          x: { title: { text: 'Sim Time (s)', display: true } },
+          y: { min: 0, max: 1, title: { text: 'Score', display: true } }
+        },
+        plugins: { legend: { position: 'bottom' } }
+      }
+    });
+
+    // --- Simulation loop (animation + sampling in sim time) ---
+    let lastFrame = performance.now();
+    let visAccumReal = 0; // throttle chart/UI updates by real time
+
+    function sample(dtSim) {
+      // Positions in arc-length
+      const pos = buses.map(b => ({ x: ((b.traveled % totalDist) + totalDist) % totalDist }));
+      pos.sort((a, b) => a.x - b.x);
+
+      // Headways
+      const headways = [];
+      for (let i = 0; i < numBuses; i++) {
+        const curr = pos[i].x;
+        const nxt  = pos[(i + 1) % numBuses].x;
+        headways.push(i === numBuses - 1 ? (totalDist - curr + pos[0].x) : (nxt - curr));
+      }
+      const threshold = tau * (totalDist / numBuses);
+
+      // Mark buses involved in < threshold gaps (counts proportionally)
+      const inBunch = new Array(numBuses).fill(false);
+      for (let i = 0; i < numBuses; i++) {
+        if (headways[i] < threshold) {
+          inBunch[i] = true;
+          inBunch[(i + 1) % numBuses] = true;
+        }
+      }
+      const bunchedCount = inBunch.filter(Boolean).length;
+      const headwayScore = bunchedCount / numBuses; // 0..1
+
+      // Campus cluster (only counts if >= 2/3 on one campus)
+      let onCAC = 0, onLIV = 0;
+      buses.forEach(b => {
+        const d = ((b.traveled % totalDist) + totalDist) % totalDist;
+        if (d >= CAC_start && d <= CAC_end) onCAC++;
+        if (d >= LIV_start && d <= LIV_end) onLIV++;
+      });
+      const CAC_ratio = onCAC / numBuses;
+      const LIV_ratio = onLIV / numBuses;
+
+      let campusText = "None";
+      let clusterScore = 0;
+      const passesThreshold = (CAC_ratio >= thresholdRatio) || (LIV_ratio >= thresholdRatio);
+      if (passesThreshold) {
+        clusterScore = Math.max(CAC_ratio, LIV_ratio); // contributes proportionally
+        campusText = (CAC_ratio >= thresholdRatio)
+          ? `College Ave (${onCAC}/${numBuses})`
+          : `Livingston (${onLIV}/${numBuses})`;
+      }
+
+      // Weighted instantaneous bunch score
+      const w_headway = 0.4, w_cluster = 0.6;
+      const bunchScore = w_headway * headwayScore + w_cluster * clusterScore;
+
+      // Proper integration in sim time (bus-seconds)
+      totalSimTime   += numBuses * dtSim;
+      bunchedSimTime += bunchScore * numBuses * dtSim;
+      const bunchRatio = bunchedSimTime / Math.max(1, totalSimTime);
+
+      // Cluster event timing (in sim seconds)
+      if (passesThreshold) {
+        if (!clusterActive) { clusterActive = true; currentClusterDurSim = 0; }
+        currentClusterDurSim += dtSim;
+      } else if (clusterActive) {
+        clusterActive = false;
+        totalClusterDurSim += currentClusterDurSim;
+        clusterEvents += 1;
+        currentClusterDurSim = 0;
+      }
+
+      // Update HUD
+      els.bscore().textContent     = bunchScore.toFixed(2);
+      els.hscore().textContent     = headwayScore.toFixed(2);
+      els.cscore().textContent     = clusterScore.toFixed(2);
+      els.bratio().textContent     = bunchRatio.toFixed(2);
+      els.bnow().textContent       = bunchedCount;
+      els.campus().textContent     = campusText;
+      const avgCluster = clusterEvents ? (totalClusterDurSim / clusterEvents) : 0;
+      els.clusterTime().textContent = `${avgCluster.toFixed(1)}s`;
+
+      // Chart (throttled by real time, label shows sim time)
+      if (visAccumReal >= 0.25) {
+        chart.data.labels.push(elapsedSim.toFixed(1));
+        chart.data.datasets[0].data.push(bunchScore);
+        chart.data.datasets[1].data.push(bunchRatio);
+        if (chart.data.labels.length > 300) {
+          chart.data.labels.shift();
+          chart.data.datasets.forEach(ds => ds.data.shift());
+        }
+        chart.update('none');
+        visAccumReal = 0;
+      }
+    }
+
+    function animate(now) {
+      const dtReal = (now - lastFrame) / 1000;   // seconds real time
+      lastFrame = now;
+      const dtSim  = dtReal * simSpeed;          // seconds simulation time
+      elapsedSim  += dtSim;
+      visAccumReal += dtReal;
+
+      // Move buses in sim time
+      buses.forEach(bus => {
+        if (!bus.paused) {
+          bus.traveled = ((bus.traveled + baseSpeed * dtSim) % totalDist + totalDist) % totalDist;
+        }
+
+        // Interpolate position along current segment
+        let distSoFar = 0, lat, lng;
+        for (const s of segments) {
+          if (bus.traveled <= distSoFar + s.dist) {
+            const p = (bus.traveled - distSoFar) / s.dist;
+            lat = s.start[0] + p * (s.end[0] - s.start[0]);
+            lng = s.start[1] + p * (s.end[1] - s.start[1]);
+            break;
+          }
+          distSoFar += s.dist;
+        }
+        const newPos = [lat, lng];
+        bus.marker.setLatLng(newPos);
+
+        // Stop detection & dwell (scaled by sim speed)
+        const stopIdx = passedStop(bus.prevPos, newPos);
+        if (stopIdx !== -1 && stopIdx !== bus.lastStop && !bus.paused) {
+          bus.paused = true; bus.lastStop = stopIdx;
+          let dur = stopTime;
+          if (Math.random() < longStopProb) dur = longStopTime;
+          setTimeout(() => { bus.paused = false; }, dur / Math.max(0.001, simSpeed));
+        }
+        if (stopIdx === -1 && bus.lastStop !== -1) bus.lastStop = -1;
+        bus.prevPos = newPos;
+      });
+
+      // Sample metrics using dtSim
+      sample(dtSim);
+
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    // --- Speed slider ---
+    const slider = document.getElementById('speedSlider');
+    const speedVal = document.getElementById('speedVal');
+    slider.addEventListener('input', () => {
+      simSpeed = parseFloat(slider.value);
+      speedVal.textContent = `${simSpeed.toFixed(1)}×`;
+    });
+  </script>
+</body>
+</html>
